@@ -5,6 +5,7 @@ import numpy as np
 
 import torch
 from torch.autograd import Variable
+from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
@@ -17,6 +18,7 @@ import torchvision.datasets as datasets
 import models
 from distributed import DistributedDataParallel as DDP
 from fp16util import network_to_half, set_grad, copy_in_params
+from collections import defaultdict
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
@@ -36,6 +38,8 @@ def get_parser():
                         help='number of data loading workers (default: 4)')
     parser.add_argument('--epochs', default=90, type=int, metavar='N',
                         help='number of total epochs to run')
+    parser.add_argument('--cross_val_seed', default=0, type=int,
+                        help='cross val seed')
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                         help='manual epoch number (useful on restarts)')
     parser.add_argument('-b', '--batch-size', default=256, type=int,
@@ -76,7 +80,67 @@ def get_parser():
 cudnn.benchmark = True
 args = get_parser().parse_args()
 
-def get_loaders(traindir, valdir, use_val_sampler=True, min_scale=0.08):
+class ImagenetCrossValTrainDataset(Dataset):
+    def __init__(self, train_dataset, test_dataset, seed=0, per_class=50):
+        self.train_len = len(train_dataset)
+        self.test_len = len(test_dataset)
+        self.test_dataset = test_dataset
+        self.train_dataset = train_dataset
+        self.test_samples = test_dataset.samples
+        self.train_samples = train_dataset.samples
+        self.per_class = per_class
+        self.train_class_dict = defaultdict(list)
+        print("Building train class dictionary")
+        for i, (path, cidx) in enumerate(self.train_samples):
+            self.train_class_dict[cidx].append(i)
+        self.new_test_idxs = []
+        np.random.seed(seed)
+        print("Building test set...")
+        for k, v in self.train_class_dict.items():
+            idxs = np.random.choice(len(v), len(v), replace=False)[:per_class]
+            for i in idxs:
+                self.new_test_idxs.append(v[i])
+        self.test_mappings = {y: i for i,y in enumerate(self.new_test_idxs)}
+
+    def __len__(self):
+        return len(self.train_samples)
+
+    def __getitem__(self, i):
+        if (i in self.test_mappings):
+            return self.test_dataset[self.test_mappings[i]]
+        else:
+            return self.train_dataset[i]
+
+class ImagenetCrossValTestDataset(Dataset):
+    def __init__(self, train_dataset, test_dataset, seed=0, per_class=50):
+        self.train_len = len(train_dataset)
+        self.test_len = len(test_dataset)
+        self.test_dataset = test_dataset
+        self.train_dataset = train_dataset
+        self.test_samples = test_dataset.samples
+        self.train_samples = train_dataset.samples
+        self.per_class = per_class
+        self.train_class_dict = defaultdict(list)
+        print("Building train class dictionary")
+        for i, (path, cidx) in enumerate(self.train_samples):
+            self.train_class_dict[cidx].append(i)
+        self.new_test_idxs = []
+        np.random.seed(seed)
+        print("Building test set...")
+        for k, v in self.train_class_dict.items():
+            idxs = np.random.choice(len(v), len(v), replace=False)[:per_class]
+            for i in idxs:
+                self.new_test_idxs.append(v[i])
+        self.new_test_idxs = np.array(self.new_test_idxs)
+        np.random.shuffle(self.new_test_idxs)
+
+    def __len__(self):
+        return len(self.new_test_idxs)
+
+    def __getitem__(self, i):
+        return self.train_dataset[self.new_test_idxs[i]]
+
+def get_loaders(traindir, valdir, use_val_sampler=True, min_scale=0.08, seed=0):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     tensor_tfm = [transforms.ToTensor(), normalize]
 
@@ -91,15 +155,20 @@ def get_loaders(traindir, valdir, use_val_sampler=True, min_scale=0.08):
             transforms.CenterCrop(args.sz),
         ] + tensor_tfm))
 
-    train_sampler = (torch.utils.data.distributed.DistributedSampler(train_dataset) if args.distributed else None)
-    val_sampler = (torch.utils.data.distributed.DistributedSampler(val_dataset) if args.distributed else None)
+    train_dataset_new = ImagenetCrossValTrainDataset(train_dataset, val_dataset)
+    test_dataset_new = ImagenetCrossValTestDataset(train_dataset, val_dataset)
+    print("Train dataset size ", len(train_dataset_new))
+    print("Test dataset size ", len(test_dataset_new))
+
+    train_sampler = (torch.utils.data.distributed.DistributedSampler(train_dataset_new) if args.distributed else None)
+    val_sampler = (torch.utils.data.distributed.DistributedSampler(test_dataset_new) if args.distributed else None)
 
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        train_dataset_new, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=int(args.batch_size), shuffle=False,
+        test_dataset_new, batch_size=int(args.batch_size), shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler if use_val_sampler else None)
 
     return train_loader,val_loader,train_sampler,val_sampler
@@ -159,7 +228,7 @@ def main():
         valdir = os.path.join(args.data, 'val')
         args.sz = 224
 
-    train_loader,val_loader,train_sampler,val_sampler = get_loaders(traindir, valdir, use_val_sampler=True)
+    train_loader,val_loader,train_sampler,val_sampler = get_loaders(traindir, valdir, use_val_sampler=True, seed=args.cross_val_seed)
 
     if args.evaluate: return validate(val_loader, model, criterion, epoch, start_time)
 
