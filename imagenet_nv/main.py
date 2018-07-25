@@ -19,6 +19,7 @@ import models
 from distributed import DistributedDataParallel as DDP
 from fp16util import network_to_half, set_grad, copy_in_params
 from collections import defaultdict
+from tensorboardX import SummaryWriter
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
@@ -40,6 +41,7 @@ def get_parser():
                         help='number of total epochs to run')
     parser.add_argument('--cross_val_seed', default=0, type=int,
                         help='cross val seed')
+    parser.add_argument('--cross_val', default=False, action="store_const", const=True)
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                         help='manual epoch number (useful on restarts)')
     parser.add_argument('-b', '--batch-size', default=256, type=int,
@@ -67,6 +69,8 @@ def get_parser():
 
     parser.add_argument('--dist-url', default='file://sync.file', type=str,
                         help='url used to set up distributed training')
+    parser.add_argument('--logdir', default='/tmp/imagenet/', type=str,
+                        help='url used to set up distributed training')
     parser.add_argument('--dist-backend', default='nccl', type=str, help='distributed backend')
 
     parser.add_argument('--world-size', default=1, type=int,
@@ -79,6 +83,7 @@ def get_parser():
 
 cudnn.benchmark = True
 args = get_parser().parse_args()
+global_step = 0
 
 class ImagenetCrossValTrainDataset(Dataset):
     def __init__(self, train_dataset, test_dataset, seed=0, per_class=50):
@@ -140,7 +145,7 @@ class ImagenetCrossValTestDataset(Dataset):
     def __getitem__(self, i):
         return self.train_dataset[self.new_test_idxs[i]]
 
-def get_loaders(traindir, valdir, use_val_sampler=True, min_scale=0.08, seed=0):
+def get_loaders(traindir, valdir, use_val_sampler=True, min_scale=0.08, seed=0, cross_val=False):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     tensor_tfm = [transforms.ToTensor(), normalize]
 
@@ -155,8 +160,13 @@ def get_loaders(traindir, valdir, use_val_sampler=True, min_scale=0.08, seed=0):
             transforms.CenterCrop(args.sz),
         ] + tensor_tfm))
 
-    train_dataset_new = ImagenetCrossValTrainDataset(train_dataset, val_dataset)
-    test_dataset_new = ImagenetCrossValTestDataset(train_dataset, val_dataset)
+    if (cross_val):
+        train_dataset_new = ImagenetCrossValTrainDataset(train_dataset, val_dataset)
+        test_dataset_new = ImagenetCrossValTestDataset(train_dataset, val_dataset)
+    else:
+        train_dataset_new = train_dataset
+        test_dataset_new = val_dataset
+
     print("Train dataset size ", len(train_dataset_new))
     print("Test dataset size ", len(test_dataset_new))
 
@@ -176,6 +186,8 @@ def get_loaders(traindir, valdir, use_val_sampler=True, min_scale=0.08, seed=0):
 
 def main():
     print("~~epoch\thours\ttop1Accuracy\n")
+    timeid = int(time.time())
+    summary_writer = SummaryWriter('{0}/arch={1}_cross_val={2}_seed_{3}_time_{4}'.format(args.logdir, args.arch, args.cross_val, args.cross_val_seed, timeid))
     start_time = datetime.now()
     args.distributed = args.world_size > 1
     args.gpu = 0
@@ -233,7 +245,7 @@ def main():
     if args.evaluate: return validate(val_loader, model, criterion, epoch, start_time)
 
     for epoch in range(args.start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch)
+        adjust_learning_rate(optimizer, epoch, summary_writer)
         if epoch==int(args.epochs*0.4+0.5):
             traindir = os.path.join(args.data, 'train')
             valdir = os.path.join(args.data, 'val')
@@ -251,10 +263,10 @@ def main():
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=UserWarning)
-            train(train_loader, model, criterion, optimizer, epoch)
+            train(train_loader, model, criterion, optimizer, epoch, summary_writer)
 
         if args.prof: break
-        prec1 = validate(val_loader, model, criterion, epoch, start_time)
+        prec1 = validate(val_loader, model, criterion, epoch, start_time, summary_writer)
 
         if args.rank == 0:
             is_best = prec1 > best_prec1
@@ -301,7 +313,8 @@ class data_prefetcher():
         return input, target
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch, summary_writer):
+    global global_step
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -335,6 +348,9 @@ def train(train_loader, model, criterion, optimizer, epoch):
             reduced_loss = reduce_tensor(loss.data)
             prec1 = reduce_tensor(prec1)
             prec5 = reduce_tensor(prec5)
+            summary_writer.add_scalar(tag='train_loss', scalar_value=reduced_loss.item(), global_step=global_step)
+            summary_writer.add_scalar(tag='top1_train', scalar_value=prec1.item(), global_step=global_step)
+            summary_writer.add_scalar(tag='top5_train', scalar_value=prec5.item(), global_step=global_step)
         else:
             reduced_loss = loss.data
 
@@ -355,6 +371,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
                     param.grad.data = param.grad.data/args.loss_scale
 
             optimizer.step()
+            global_step += 1
             copy_in_params(model, param_copy)
             torch.cuda.synchronize()
         else:
@@ -379,7 +396,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
                    data_time=data_time, loss=losses, top1=top1, top5=top5))
 
 
-def validate(val_loader, model, criterion, epoch, start_time):
+def validate(val_loader, model, criterion, epoch, start_time, summary_writer):
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -404,12 +421,15 @@ def validate(val_loader, model, criterion, epoch, start_time):
             loss = criterion(output, target_var)
 
         reduced_loss = reduce_tensor(loss.data)
+        summary_writer.add_scalar(tag='val_loss', scalar_value=reduced_loss.item(), global_step=global_step)
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
 
         reduced_prec1 = reduce_tensor(prec1)
         reduced_prec5 = reduce_tensor(prec5)
+        summary_writer.add_scalar(tag='top1_val', scalar_value=reduced_prec1.item(), global_step=global_step)
+        summary_writer.add_scalar(tag='top5_val', scalar_value=reduced_prec5.item(), global_step=global_step)
 
         losses.update(to_python_float(reduced_loss), input.size(0))
         top1.update(to_python_float(prec1), input.size(0))
@@ -461,7 +481,7 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def adjust_learning_rate(optimizer, epoch):
+def adjust_learning_rate(optimizer, epoch, summary_writer):
     """Sets the learning rate to the initial LR decayed by 10 every few epochs"""
     if   epoch<4 : lr = args.lr/(4-epoch)
     elif epoch<int(args.epochs*0.47+0.5): lr = args.lr/1
@@ -469,6 +489,7 @@ def adjust_learning_rate(optimizer, epoch):
     elif epoch<int(args.epochs*0.95+0.5): lr = args.lr/100
     else         : lr = args.lr/1000
     for param_group in optimizer.param_groups: param_group['lr'] = lr
+    summary_writer.add_scalar(tag='learning_rate', scalar_value=lr, global_step=global_step)
 
 
 def accuracy(output, target, topk=(1,)):
