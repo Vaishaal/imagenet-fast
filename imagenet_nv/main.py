@@ -39,6 +39,8 @@ def get_parser():
                         help='number of data loading workers (default: 4)')
     parser.add_argument('--epochs', default=90, type=int, metavar='N',
                         help='number of total epochs to run')
+    parser.add_argument('--fold', default=0, type=int, metavar='N',
+                        help='cross val fold')
     parser.add_argument('--cross_val_seed', default=0, type=int,
                         help='cross val seed')
     parser.add_argument('--cross_val', default=False, action="store_const", const=True)
@@ -86,7 +88,7 @@ args = get_parser().parse_args()
 global_step = 0
 
 class ImagenetCrossValTrainDataset(Dataset):
-    def __init__(self, train_dataset, test_dataset, seed=0, per_class=50):
+    def __init__(self, train_dataset, test_dataset, seed=0, per_class=50, fold=0):
         self.train_len = len(train_dataset)
         self.test_len = len(test_dataset)
         self.test_dataset = test_dataset
@@ -102,7 +104,7 @@ class ImagenetCrossValTrainDataset(Dataset):
         np.random.seed(seed)
         print("Building test set...")
         for k, v in self.train_class_dict.items():
-            idxs = np.random.choice(len(v), len(v), replace=False)[:per_class]
+            idxs = np.random.choice(len(v), len(v), replace=False)[fold*per_class:(fold+1)*per_class]
             for i in idxs:
                 self.new_test_idxs.append(v[i])
         self.test_mappings = {y: i for i,y in enumerate(self.new_test_idxs)}
@@ -117,7 +119,7 @@ class ImagenetCrossValTrainDataset(Dataset):
             return self.train_dataset[i]
 
 class ImagenetCrossValTestDataset(Dataset):
-    def __init__(self, train_dataset, test_dataset, seed=0, per_class=50):
+    def __init__(self, train_dataset, test_dataset, seed=0, per_class=50, fold=0):
         self.train_len = len(train_dataset)
         self.test_len = len(test_dataset)
         self.test_dataset = test_dataset
@@ -133,7 +135,7 @@ class ImagenetCrossValTestDataset(Dataset):
         np.random.seed(seed)
         print("Building test set...")
         for k, v in self.train_class_dict.items():
-            idxs = np.random.choice(len(v), len(v), replace=False)[:per_class]
+            idxs = np.random.choice(len(v), len(v), replace=False)[fold*per_class:(fold+1)*per_class]
             for i in idxs:
                 self.new_test_idxs.append(v[i])
         self.new_test_idxs = np.array(self.new_test_idxs)
@@ -145,7 +147,7 @@ class ImagenetCrossValTestDataset(Dataset):
     def __getitem__(self, i):
         return self.train_dataset[self.new_test_idxs[i]]
 
-def get_loaders(traindir, valdir, use_val_sampler=True, min_scale=0.08, seed=0, cross_val=False):
+def get_loaders(traindir, valdir, use_val_sampler=True, min_scale=0.08, seed=0, cross_val=False, fold=0):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     tensor_tfm = [transforms.ToTensor(), normalize]
 
@@ -161,8 +163,8 @@ def get_loaders(traindir, valdir, use_val_sampler=True, min_scale=0.08, seed=0, 
         ] + tensor_tfm))
 
     if (cross_val):
-        train_dataset_new = ImagenetCrossValTrainDataset(train_dataset, val_dataset)
-        test_dataset_new = ImagenetCrossValTestDataset(train_dataset, val_dataset)
+        train_dataset_new = ImagenetCrossValTrainDataset(train_dataset, val_dataset, fold=fold, seed=seed)
+        test_dataset_new = ImagenetCrossValTestDataset(train_dataset, val_dataset, fold=fold, seed=seed)
     else:
         train_dataset_new = train_dataset
         test_dataset_new = val_dataset
@@ -187,7 +189,7 @@ def get_loaders(traindir, valdir, use_val_sampler=True, min_scale=0.08, seed=0, 
 def main():
     print("~~epoch\thours\ttop1Accuracy\n")
     timeid = int(time.time())
-    summary_writer = SummaryWriter('{0}/arch={1}_cross_val={2}_seed_{3}_time_{4}'.format(args.logdir, args.arch, args.cross_val, args.cross_val_seed, timeid))
+    summary_writer = SummaryWriter('{0}/arch={1}_cross_val={2}_seed_{3}_time_{4}_cross_val_fold={5}'.format(args.logdir, args.arch, args.cross_val, args.cross_val_seed, timeid, args.fold))
     start_time = datetime.now()
     args.distributed = args.world_size > 1
     args.gpu = 0
@@ -240,7 +242,7 @@ def main():
         valdir = os.path.join(args.data, 'val')
         args.sz = 224
 
-    train_loader,val_loader,train_sampler,val_sampler = get_loaders(traindir, valdir, use_val_sampler=True, seed=args.cross_val_seed)
+    train_loader,val_loader,train_sampler,val_sampler = get_loaders(traindir, valdir, use_val_sampler=True, seed=args.cross_val_seed, cross_val=args.cross_val, fold=args.fold)
 
     if args.evaluate: return validate(val_loader, model, criterion, epoch, start_time)
 
